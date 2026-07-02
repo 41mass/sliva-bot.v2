@@ -17,7 +17,16 @@ def main_menu() -> ReplyKeyboardMarkup:
 def reuse_data_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Оставить прошлые данные", callback_data="checkout_reuse_data")]
+            [InlineKeyboardButton(text="Оставить прошлые данные", callback_data="checkout_reuse_data")],
+            [InlineKeyboardButton(text="Отменить оформление", callback_data="cancel_checkout")],
+        ]
+    )
+
+
+def checkout_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Отменить оформление", callback_data="cancel_checkout")]
         ]
     )
 
@@ -39,6 +48,8 @@ def catalog(products: list[dict]) -> InlineKeyboardMarkup:
             text=f"{product['name']} - {product['price_per_kg']:g} ₽/кг",
             callback_data=f"product:{product['id']}",
         )
+    builder.button(text="Корзина", callback_data="show_cart")
+    builder.button(text="Главное меню", callback_data="show_main_menu")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -52,6 +63,10 @@ def product_actions(product_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="+2 кг", callback_data=f"cart_add:{product_id}:2"),
             ],
             [InlineKeyboardButton(text="В каталог", callback_data="show_catalog")],
+            [
+                InlineKeyboardButton(text="Корзина", callback_data="show_cart"),
+                InlineKeyboardButton(text="Главное меню", callback_data="show_main_menu"),
+            ],
         ]
     )
 
@@ -61,6 +76,10 @@ def cart_actions() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="Оформить заказ", callback_data="checkout")],
             [InlineKeyboardButton(text="Очистить корзину", callback_data="cart_clear")],
+            [
+                InlineKeyboardButton(text="В каталог", callback_data="show_catalog"),
+                InlineKeyboardButton(text="Главное меню", callback_data="show_main_menu"),
+            ],
         ]
     )
 
@@ -70,6 +89,7 @@ def pay_order(order_id: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="Оплатить заказ (тест)", callback_data=f"pay:{order_id}")],
             [InlineKeyboardButton(text="Мои заказы", callback_data="my_orders")],
+            [InlineKeyboardButton(text="Главное меню", callback_data="show_main_menu")],
         ]
     )
 
@@ -79,8 +99,29 @@ def user_orders_list(orders: list[dict]) -> InlineKeyboardMarkup:
     for order in orders:
         label = f"#{order['id']} | {order['created_at'][:16]} | {order['status']}"
         builder.button(text=label, callback_data=f"user_order_detail:{order['id']}")
+    builder.button(text="Главное меню", callback_data="show_main_menu")
     builder.adjust(1)
     return builder.as_markup()
+
+
+def user_order_detail_actions() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Мои заказы", callback_data="my_orders")],
+            [InlineKeyboardButton(text="Главное меню", callback_data="show_main_menu")],
+        ]
+    )
+
+
+def main_inline_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Каталог", callback_data="show_catalog")],
+            [InlineKeyboardButton(text="Корзина", callback_data="show_cart")],
+            [InlineKeyboardButton(text="Мои заказы", callback_data="my_orders")],
+            [InlineKeyboardButton(text="Мои данные", callback_data="show_my_data")],
+        ]
+    )
 
 
 def admin_products(products: list[dict]) -> InlineKeyboardMarkup:
