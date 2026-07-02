@@ -14,6 +14,14 @@ def main_menu() -> ReplyKeyboardMarkup:
     )
 
 
+def reuse_data_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Оставить прошлые данные", callback_data="checkout_reuse_data")]
+        ]
+    )
+
+
 def admin_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -102,6 +110,16 @@ def admin_order_actions(order_id: int) -> InlineKeyboardMarkup:
     for status in ORDER_STATUSES:
         builder.button(text=f"Статус: {status}", callback_data=f"admin_set_status:{order_id}:{status}")
     builder.button(text="Удалить заказ", callback_data=f"admin_delete_order:{order_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_orders_list(orders: list[dict]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for order in orders:
+        full_name = order.get("full_name") or "Без имени"
+        label = f"#{order['id']} | {order['created_at'][:16]} | {full_name}"
+        builder.button(text=label, callback_data=f"admin_order_detail:{order['id']}")
     builder.adjust(1)
     return builder.as_markup()
 

@@ -63,3 +63,10 @@ def order_text(order: dict[str, Any], items: list[dict[str, Any]], admin: bool =
     if admin:
         lines.append(f"Покупатель: {customer_link(int(order['customer_id']), order.get('username'))}")
     return "\n".join(lines)
+
+
+def order_summary_line(order: dict[str, Any]) -> str:
+    return (
+        f"#{order['id']} | {escape(order['created_at'][:16])} | "
+        f"{escape(order.get('full_name') or 'Без имени')} | {escape(order['status'])}"
+    )

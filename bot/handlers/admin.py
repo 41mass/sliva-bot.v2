@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from bot.db import Database, ORDER_STATUSES
-from bot.formatters import customer_link, money, order_text, product_line
+from bot.formatters import customer_link, money, order_summary_line, order_text, product_line
 from bot.keyboards import (
     admin_customer_actions,
     admin_menu,
+    admin_orders_list,
     admin_order_actions,
     admin_orders_menu,
     admin_product_actions,
@@ -19,6 +21,31 @@ from bot.states import AdminLogin, AdminProduct
 
 
 router = Router()
+
+
+async def safe_delete(message: Message | None) -> None:
+    if not message:
+        return
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+
+async def safe_edit_or_answer(message: Message, text: str, reply_markup=None) -> Message:
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+        return message
+    except TelegramBadRequest:
+        return await message.answer(text, reply_markup=reply_markup)
+
+
+async def send_orders_list(message: Message, orders: list[dict]) -> None:
+    if not orders:
+        await safe_edit_or_answer(message, "Заказов за этот период нет.")
+        return
+    text = "Заказы:\n\n" + "\n".join(order_summary_line(order) for order in orders[:20])
+    await safe_edit_or_answer(message, text, reply_markup=admin_orders_list(orders[:20]))
 
 
 def parse_product_input(text: str) -> tuple[str, float, float] | None:
@@ -59,6 +86,7 @@ async def admin_login_password(message: Message, state: FSMContext, db: Database
 async def products_admin(message: Message, db: Database) -> None:
     if not await require_admin(message, db):
         return
+    await safe_delete(message)
     products = await db.products(active_only=False)
     await message.answer("Номенклатура:", reply_markup=admin_products(products))
 
@@ -70,7 +98,7 @@ async def product_admin_card(callback: CallbackQuery, db: Database) -> None:
         return
     product_id = int(callback.data.split(":")[1])
     product = await db.product(product_id)
-    await callback.message.answer(product_line(product), reply_markup=admin_product_actions(product_id))
+    await safe_edit_or_answer(callback.message, product_line(product), reply_markup=admin_product_actions(product_id))
     await callback.answer()
 
 
@@ -161,6 +189,7 @@ async def delete_product(callback: CallbackQuery, db: Database) -> None:
 async def orders_admin(message: Message, db: Database) -> None:
     if not await require_admin(message, db):
         return
+    await safe_delete(message)
     await message.answer("Какие заказы показать?", reply_markup=admin_orders_menu())
 
 
@@ -171,11 +200,22 @@ async def orders_list(callback: CallbackQuery, db: Database) -> None:
         return
     period = callback.data.split(":")[1]
     orders = await db.orders(period=period)
-    if not orders:
-        await callback.message.answer("Заказов за этот период нет.")
-    for order in orders[:20]:
-        items = await db.order_items(order["id"])
-        await callback.message.answer(order_text(order, items, admin=True), reply_markup=admin_order_actions(order["id"]))
+    await send_orders_list(callback.message, orders)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_order_detail:"))
+async def order_detail(callback: CallbackQuery, db: Database) -> None:
+    if not await db.is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    order_id = int(callback.data.split(":")[1])
+    order = await db.order(order_id)
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    items = await db.order_items(order_id)
+    await safe_edit_or_answer(callback.message, order_text(order, items, admin=True), reply_markup=admin_order_actions(order_id))
     await callback.answer()
 
 
@@ -193,7 +233,7 @@ async def orders_by_product_start(callback: CallbackQuery, state: FSMContext, db
         + "\n".join(f"#{product['id']} {product['name']}" for product in products)
     )
     await state.set_state(AdminProduct.orders_by_product)
-    await callback.message.answer(text)
+    await safe_edit_or_answer(callback.message, text)
     await callback.answer()
 
 
@@ -211,12 +251,14 @@ async def orders_by_product_finish(message: Message, state: FSMContext, db: Data
         return
     orders = await db.orders(period=period, product_id=product_id)
     await state.clear()
+    await safe_delete(message)
     if not orders:
         await message.answer("Заказов по этой позиции нет.", reply_markup=admin_menu())
-        return
-    for order in orders[:20]:
-        items = await db.order_items(order["id"])
-        await message.answer(order_text(order, items, admin=True), reply_markup=admin_order_actions(order["id"]))
+    else:
+        await message.answer(
+            "Заказы по позиции:\n\n" + "\n".join(order_summary_line(order) for order in orders[:20]),
+            reply_markup=admin_orders_list(orders[:20]),
+        )
 
 
 @router.callback_query(F.data.startswith("admin_set_status:"))
@@ -229,7 +271,13 @@ async def set_status(callback: CallbackQuery, db: Database) -> None:
         await callback.answer("Неизвестный статус", show_alert=True)
         return
     await db.set_order_status(int(order_id), status)
-    await callback.message.answer(f"Заказ #{order_id}: статус изменен на «{status}».")
+    order = await db.order(int(order_id))
+    items = await db.order_items(int(order_id))
+    await safe_edit_or_answer(
+        callback.message,
+        f"Статус изменен на «{status}».\n\n" + order_text(order, items, admin=True),
+        reply_markup=admin_order_actions(int(order_id)),
+    )
     await callback.answer()
 
 
@@ -271,11 +319,7 @@ async def customer_orders(callback: CallbackQuery, db: Database) -> None:
         return
     customer_id = int(callback.data.split(":")[1])
     orders = await db.orders(customer_id=customer_id)
-    if not orders:
-        await callback.message.answer("У этого клиента пока нет заказов.")
-    for order in orders[:20]:
-        items = await db.order_items(order["id"])
-        await callback.message.answer(order_text(order, items, admin=True), reply_markup=admin_order_actions(order["id"]))
+    await send_orders_list(callback.message, orders)
     await callback.answer()
 
 

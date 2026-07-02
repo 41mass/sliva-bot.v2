@@ -1,17 +1,56 @@
 from __future__ import annotations
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from bot.config import Config
 from bot.db import Database
 from bot.formatters import cart_text, order_text, product_line
-from bot.keyboards import cart_actions, catalog, main_menu, pay_order, product_actions
+from bot.keyboards import cart_actions, catalog, main_menu, pay_order, product_actions, reuse_data_keyboard
 from bot.states import Checkout
 
 
 router = Router()
+
+
+async def safe_delete(message: Message | None) -> None:
+    if not message:
+        return
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+
+async def safe_edit_or_answer(message: Message, text: str, reply_markup=None) -> Message:
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+        return message
+    except TelegramBadRequest:
+        return await message.answer(text, reply_markup=reply_markup)
+
+
+async def delete_checkout_prompt(bot: Bot, chat_id: int, state: FSMContext) -> None:
+    data = await state.get_data()
+    prompt_id = data.get("prompt_message_id")
+    if not prompt_id:
+        return
+    try:
+        await bot.delete_message(chat_id, int(prompt_id))
+    except TelegramBadRequest:
+        pass
+
+
+async def send_checkout_prompt(
+    message: Message,
+    state: FSMContext,
+    text: str,
+    reply_markup=None,
+) -> None:
+    sent = await message.answer(text, reply_markup=reply_markup)
+    await state.update_data(prompt_message_id=sent.message_id)
 
 
 async def show_catalog(message: Message, db: Database) -> None:
@@ -38,13 +77,17 @@ async def start(message: Message, db: Database) -> None:
 
 @router.message(F.text == "Каталог")
 async def catalog_message(message: Message, db: Database) -> None:
+    await safe_delete(message)
     await show_catalog(message, db)
 
 
 @router.callback_query(F.data == "show_catalog")
 async def catalog_callback(callback: CallbackQuery, db: Database) -> None:
-    await callback.message.delete()
-    await show_catalog(callback.message, db)
+    products = await db.products()
+    if not products:
+        await safe_edit_or_answer(callback.message, "Каталог пока пуст.")
+    else:
+        await safe_edit_or_answer(callback.message, "Выберите позицию:", reply_markup=catalog(products))
     await callback.answer()
 
 
@@ -55,7 +98,7 @@ async def product_card(callback: CallbackQuery, db: Database) -> None:
     if not product or not product["is_active"]:
         await callback.answer("Позиция недоступна.", show_alert=True)
         return
-    await callback.message.answer(product_line(product), reply_markup=product_actions(product_id))
+    await safe_edit_or_answer(callback.message, product_line(product), reply_markup=product_actions(product_id))
     await callback.answer()
 
 
@@ -68,6 +111,7 @@ async def add_to_cart(callback: CallbackQuery, db: Database) -> None:
 
 @router.message(F.text == "Корзина")
 async def cart_message(message: Message, db: Database) -> None:
+    await safe_delete(message)
     items = await db.cart(message.from_user.id)
     markup = cart_actions() if items else None
     await message.answer(cart_text(items), reply_markup=markup)
@@ -76,7 +120,7 @@ async def cart_message(message: Message, db: Database) -> None:
 @router.callback_query(F.data == "cart_clear")
 async def clear_cart(callback: CallbackQuery, db: Database) -> None:
     await db.clear_cart(callback.from_user.id)
-    await callback.message.answer("Корзина очищена.")
+    await safe_edit_or_answer(callback.message, "Корзина очищена.")
     await callback.answer()
 
 
@@ -87,44 +131,105 @@ async def checkout_start(callback: CallbackQuery, state: FSMContext, db: Databas
         await callback.answer("Корзина пустая.", show_alert=True)
         return
     customer = await db.fetch_one("SELECT * FROM customers WHERE telegram_id = ?", (callback.from_user.id,))
+    has_saved_data = bool(customer and customer.get("phone") and customer.get("full_name") and customer.get("address"))
+    await safe_delete(callback.message)
     await state.set_state(Checkout.phone)
-    hint = f"\nВаш прошлый номер: {customer['phone']}" if customer and customer.get("phone") else ""
-    await callback.message.answer("Введите телефон для связи." + hint)
+    if has_saved_data:
+        await state.update_data(
+            saved_phone=customer["phone"],
+            saved_full_name=customer["full_name"],
+            saved_address=customer["address"],
+        )
+        text = (
+            "Можно оставить прошлые данные:\n"
+            f"ФИО: {customer['full_name']}\n"
+            f"Телефон: {customer['phone']}\n"
+            f"Адрес: {customer['address']}\n\n"
+            "Нажмите «Оставить прошлые данные» или введите новый телефон."
+        )
+        await send_checkout_prompt(callback.message, state, text, reply_markup=reuse_data_keyboard())
+    else:
+        await send_checkout_prompt(callback.message, state, "Введите телефон для связи.")
+    await callback.answer()
+
+
+@router.callback_query(Checkout.phone, F.data == "checkout_reuse_data")
+async def checkout_reuse_data(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    if not data.get("saved_phone"):
+        await callback.answer("Сохраненных данных пока нет.", show_alert=True)
+        return
+    await state.update_data(
+        phone=data["saved_phone"],
+        full_name=data["saved_full_name"],
+        address=data["saved_address"],
+    )
+    await state.set_state(Checkout.delivery_datetime)
+    await safe_edit_or_answer(
+        callback.message,
+        "Хорошо, оставил прошлые ФИО, телефон и адрес.\nВведите дату и время доставки. Например: 05.07 после 18:00",
+    )
+    await state.update_data(prompt_message_id=callback.message.message_id)
     await callback.answer()
 
 
 @router.message(Checkout.phone)
-async def checkout_phone(message: Message, state: FSMContext) -> None:
+async def checkout_phone(message: Message, state: FSMContext, bot: Bot) -> None:
+    await delete_checkout_prompt(bot, message.chat.id, state)
+    data = await state.get_data()
+    if message.text.strip() == "Оставить прошлые данные" and data.get("saved_phone"):
+        await state.update_data(
+            phone=data["saved_phone"],
+            full_name=data["saved_full_name"],
+            address=data["saved_address"],
+        )
+        await state.set_state(Checkout.delivery_datetime)
+        await safe_delete(message)
+        await send_checkout_prompt(
+            message,
+            state,
+            "Хорошо, оставил прошлые ФИО, телефон и адрес.\nВведите дату и время доставки. Например: 05.07 после 18:00",
+        )
+        return
     await state.update_data(phone=message.text.strip())
     await state.set_state(Checkout.full_name)
-    await message.answer("Введите ФИО получателя.")
+    await safe_delete(message)
+    await send_checkout_prompt(message, state, "Введите ФИО получателя.")
 
 
 @router.message(Checkout.full_name)
-async def checkout_full_name(message: Message, state: FSMContext) -> None:
+async def checkout_full_name(message: Message, state: FSMContext, bot: Bot) -> None:
+    await delete_checkout_prompt(bot, message.chat.id, state)
     await state.update_data(full_name=message.text.strip())
     await state.set_state(Checkout.address)
-    await message.answer("Введите адрес доставки.")
+    await safe_delete(message)
+    await send_checkout_prompt(message, state, "Введите адрес доставки.")
 
 
 @router.message(Checkout.address)
-async def checkout_address(message: Message, state: FSMContext) -> None:
+async def checkout_address(message: Message, state: FSMContext, bot: Bot) -> None:
+    await delete_checkout_prompt(bot, message.chat.id, state)
     await state.update_data(address=message.text.strip())
     await state.set_state(Checkout.delivery_datetime)
-    await message.answer("Введите дату и время доставки. Например: 05.07 после 18:00")
+    await safe_delete(message)
+    await send_checkout_prompt(message, state, "Введите дату и время доставки. Например: 05.07 после 18:00")
 
 
 @router.message(Checkout.delivery_datetime)
-async def checkout_delivery(message: Message, state: FSMContext) -> None:
+async def checkout_delivery(message: Message, state: FSMContext, bot: Bot) -> None:
+    await delete_checkout_prompt(bot, message.chat.id, state)
     await state.update_data(delivery_datetime=message.text.strip())
     await state.set_state(Checkout.comment)
-    await message.answer("Комментарий к заказу. Если комментария нет, напишите «нет».")
+    await safe_delete(message)
+    await send_checkout_prompt(message, state, "Комментарий к заказу. Если комментария нет, напишите «нет».")
 
 
 @router.message(Checkout.comment)
 async def checkout_finish(message: Message, state: FSMContext, db: Database, bot: Bot, config: Config) -> None:
+    await delete_checkout_prompt(bot, message.chat.id, state)
     data = await state.get_data()
     comment = "" if message.text.strip().lower() in {"нет", "-", "no"} else message.text.strip()
+    await safe_delete(message)
     await db.upsert_customer(
         telegram_id=message.from_user.id,
         username=message.from_user.username,
@@ -142,7 +247,7 @@ async def checkout_finish(message: Message, state: FSMContext, db: Database, bot
     )
     await state.clear()
     if not ok or order_id is None:
-        await message.answer(text)
+        await message.answer(text, reply_markup=main_menu())
         return
     order = await db.order(order_id)
     items = await db.order_items(order_id)
@@ -163,11 +268,11 @@ async def pay(callback: CallbackQuery, db: Database, bot: Bot, config: Config) -
     ok, text = await db.mark_paid_and_write_off_stock(order_id, callback.from_user.id)
     order = await db.order(order_id)
     if not ok:
-        await callback.message.answer(text + "\nМожно изменить заказ или написать магазину.")
+        await safe_edit_or_answer(callback.message, text + "\nМожно изменить заказ или написать магазину.")
         await callback.answer("Оплата не прошла", show_alert=True)
         return
     items = await db.order_items(order_id)
-    await callback.message.answer(text + "\n\n" + order_text(order, items))
+    await safe_edit_or_answer(callback.message, text + "\n\n" + order_text(order, items))
     if config.admin_notify_id:
         await bot.send_message(
             config.admin_notify_id,
