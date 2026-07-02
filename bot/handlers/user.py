@@ -7,8 +7,8 @@ from aiogram.types import CallbackQuery, Message
 
 from bot.config import Config
 from bot.db import Database
-from bot.formatters import cart_text, order_text, product_line
-from bot.keyboards import cart_actions, catalog, main_menu, pay_order, product_actions, reuse_data_keyboard
+from bot.formatters import cart_text, order_text, product_line, user_order_summary_line
+from bot.keyboards import cart_actions, catalog, main_menu, pay_order, product_actions, reuse_data_keyboard, user_orders_list
 from bot.states import Checkout
 
 
@@ -28,8 +28,26 @@ async def safe_edit_or_answer(message: Message, text: str, reply_markup=None) ->
     try:
         await message.edit_text(text, reply_markup=reply_markup)
         return message
-    except TelegramBadRequest:
+    except TelegramBadRequest as error:
+        if "message is not modified" in str(error).lower():
+            return message
         return await message.answer(text, reply_markup=reply_markup)
+
+
+async def delete_active_screen(bot: Bot, chat_id: int, state: FSMContext, keep_message_id: int | None = None) -> None:
+    data = await state.get_data()
+    screen_id = data.get("active_screen_message_id")
+    if not screen_id or int(screen_id) == keep_message_id:
+        return
+    try:
+        await bot.delete_message(chat_id, int(screen_id))
+    except TelegramBadRequest:
+        pass
+    await state.update_data(active_screen_message_id=None)
+
+
+async def remember_active_screen(state: FSMContext, message: Message) -> None:
+    await state.update_data(active_screen_message_id=message.message_id)
 
 
 async def delete_checkout_prompt(bot: Bot, chat_id: int, state: FSMContext) -> None:
@@ -53,52 +71,61 @@ async def send_checkout_prompt(
     await state.update_data(prompt_message_id=sent.message_id)
 
 
-async def show_catalog(message: Message, db: Database) -> None:
+async def show_catalog(message: Message, db: Database, state: FSMContext, bot: Bot) -> None:
     products = await db.products()
+    await delete_active_screen(bot, message.chat.id, state)
     if not products:
-        await message.answer("Каталог пока пуст.", reply_markup=main_menu())
+        sent = await message.answer("Каталог пока пуст.", reply_markup=main_menu())
+        await remember_active_screen(state, sent)
         return
-    await message.answer("Выберите позицию:", reply_markup=catalog(products))
+    sent = await message.answer("Выберите позицию:", reply_markup=catalog(products))
+    await remember_active_screen(state, sent)
 
 
 @router.message(F.text == "/start")
-async def start(message: Message, db: Database) -> None:
+async def start(message: Message, db: Database, state: FSMContext, bot: Bot) -> None:
+    await safe_delete(message)
+    await delete_active_screen(bot, message.chat.id, state)
     await db.upsert_customer(
         telegram_id=message.from_user.id,
         username=message.from_user.username,
         full_name=message.from_user.full_name,
     )
-    await message.answer(
+    sent = await message.answer(
         "Здравствуйте! Это магазин сухофруктов «Слива».\n\n"
         "Здесь можно выбрать товары, оформить доставку и посмотреть свои заказы.",
         reply_markup=main_menu(),
     )
+    await remember_active_screen(state, sent)
 
 
 @router.message(F.text == "Каталог")
-async def catalog_message(message: Message, db: Database) -> None:
+async def catalog_message(message: Message, db: Database, state: FSMContext, bot: Bot) -> None:
     await safe_delete(message)
-    await show_catalog(message, db)
+    await show_catalog(message, db, state, bot)
 
 
 @router.callback_query(F.data == "show_catalog")
-async def catalog_callback(callback: CallbackQuery, db: Database) -> None:
+async def catalog_callback(callback: CallbackQuery, db: Database, state: FSMContext, bot: Bot) -> None:
     products = await db.products()
+    await delete_active_screen(bot, callback.message.chat.id, state, keep_message_id=callback.message.message_id)
     if not products:
-        await safe_edit_or_answer(callback.message, "Каталог пока пуст.")
+        screen = await safe_edit_or_answer(callback.message, "Каталог пока пуст.")
     else:
-        await safe_edit_or_answer(callback.message, "Выберите позицию:", reply_markup=catalog(products))
+        screen = await safe_edit_or_answer(callback.message, "Выберите позицию:", reply_markup=catalog(products))
+    await remember_active_screen(state, screen)
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("product:"))
-async def product_card(callback: CallbackQuery, db: Database) -> None:
+async def product_card(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
     product_id = int(callback.data.split(":")[1])
     product = await db.product(product_id)
     if not product or not product["is_active"]:
         await callback.answer("Позиция недоступна.", show_alert=True)
         return
-    await safe_edit_or_answer(callback.message, product_line(product), reply_markup=product_actions(product_id))
+    screen = await safe_edit_or_answer(callback.message, product_line(product), reply_markup=product_actions(product_id))
+    await remember_active_screen(state, screen)
     await callback.answer()
 
 
@@ -110,17 +137,20 @@ async def add_to_cart(callback: CallbackQuery, db: Database) -> None:
 
 
 @router.message(F.text == "Корзина")
-async def cart_message(message: Message, db: Database) -> None:
+async def cart_message(message: Message, db: Database, state: FSMContext, bot: Bot) -> None:
     await safe_delete(message)
+    await delete_active_screen(bot, message.chat.id, state)
     items = await db.cart(message.from_user.id)
     markup = cart_actions() if items else None
-    await message.answer(cart_text(items), reply_markup=markup)
+    sent = await message.answer(cart_text(items), reply_markup=markup)
+    await remember_active_screen(state, sent)
 
 
 @router.callback_query(F.data == "cart_clear")
-async def clear_cart(callback: CallbackQuery, db: Database) -> None:
+async def clear_cart(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
     await db.clear_cart(callback.from_user.id)
-    await safe_edit_or_answer(callback.message, "Корзина очищена.")
+    screen = await safe_edit_or_answer(callback.message, "Корзина очищена.")
+    await remember_active_screen(state, screen)
     await callback.answer()
 
 
@@ -133,6 +163,7 @@ async def checkout_start(callback: CallbackQuery, state: FSMContext, db: Databas
     customer = await db.fetch_one("SELECT * FROM customers WHERE telegram_id = ?", (callback.from_user.id,))
     has_saved_data = bool(customer and customer.get("phone") and customer.get("full_name") and customer.get("address"))
     await safe_delete(callback.message)
+    await state.update_data(active_screen_message_id=None)
     await state.set_state(Checkout.phone)
     if has_saved_data:
         await state.update_data(
@@ -247,14 +278,16 @@ async def checkout_finish(message: Message, state: FSMContext, db: Database, bot
     )
     await state.clear()
     if not ok or order_id is None:
-        await message.answer(text, reply_markup=main_menu())
+        sent = await message.answer(text, reply_markup=main_menu())
+        await remember_active_screen(state, sent)
         return
     order = await db.order(order_id)
     items = await db.order_items(order_id)
-    await message.answer(
+    sent = await message.answer(
         order_text(order, items) + "\n\nНажмите кнопку оплаты. Сейчас это тестовая кнопка-заглушка.",
         reply_markup=pay_order(order_id),
     )
+    await remember_active_screen(state, sent)
     if config.admin_notify_id:
         await bot.send_message(
             config.admin_notify_id,
@@ -263,16 +296,18 @@ async def checkout_finish(message: Message, state: FSMContext, db: Database, bot
 
 
 @router.callback_query(F.data.startswith("pay:"))
-async def pay(callback: CallbackQuery, db: Database, bot: Bot, config: Config) -> None:
+async def pay(callback: CallbackQuery, db: Database, bot: Bot, config: Config, state: FSMContext) -> None:
     order_id = int(callback.data.split(":")[1])
     ok, text = await db.mark_paid_and_write_off_stock(order_id, callback.from_user.id)
     order = await db.order(order_id)
     if not ok:
-        await safe_edit_or_answer(callback.message, text + "\nМожно изменить заказ или написать магазину.")
+        screen = await safe_edit_or_answer(callback.message, text + "\nМожно изменить заказ или написать магазину.")
+        await remember_active_screen(state, screen)
         await callback.answer("Оплата не прошла", show_alert=True)
         return
     items = await db.order_items(order_id)
-    await safe_edit_or_answer(callback.message, text + "\n\n" + order_text(order, items))
+    screen = await safe_edit_or_answer(callback.message, text + "\n\n" + order_text(order, items))
+    await remember_active_screen(state, screen)
     if config.admin_notify_id:
         await bot.send_message(
             config.admin_notify_id,
@@ -283,30 +318,51 @@ async def pay(callback: CallbackQuery, db: Database, bot: Bot, config: Config) -
 
 @router.message(F.text == "Мои заказы")
 @router.callback_query(F.data == "my_orders")
-async def my_orders(event: Message | CallbackQuery, db: Database) -> None:
+async def my_orders(event: Message | CallbackQuery, db: Database, state: FSMContext, bot: Bot) -> None:
     user_id = event.from_user.id
     orders = await db.orders(customer_id=user_id)
     target = event.message if isinstance(event, CallbackQuery) else event
+    await delete_active_screen(bot, target.chat.id, state, keep_message_id=target.message_id if isinstance(event, CallbackQuery) else None)
+    if isinstance(event, Message):
+        await safe_delete(event)
     if not orders:
-        await target.answer("У вас пока нет заказов.")
+        sent = await target.answer("У вас пока нет заказов.")
+        await remember_active_screen(state, sent)
     else:
-        for order in orders[:10]:
-            items = await db.order_items(order["id"])
-            await target.answer(order_text(order, items))
+        text = "Ваши заказы:\n\n" + "\n".join(user_order_summary_line(order) for order in orders[:10])
+        sent = await target.answer(text, reply_markup=user_orders_list(orders[:10]))
+        await remember_active_screen(state, sent)
     if isinstance(event, CallbackQuery):
         await event.answer()
 
 
+@router.callback_query(F.data.startswith("user_order_detail:"))
+async def user_order_detail(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    order_id = int(callback.data.split(":")[1])
+    order = await db.order(order_id)
+    if not order or int(order["customer_id"]) != callback.from_user.id:
+        await callback.answer("Заказ не найден.", show_alert=True)
+        return
+    items = await db.order_items(order_id)
+    screen = await safe_edit_or_answer(callback.message, order_text(order, items))
+    await remember_active_screen(state, screen)
+    await callback.answer()
+
+
 @router.message(F.text == "Мои данные")
-async def my_data(message: Message, db: Database) -> None:
+async def my_data(message: Message, db: Database, state: FSMContext, bot: Bot) -> None:
+    await safe_delete(message)
+    await delete_active_screen(bot, message.chat.id, state)
     customer = await db.fetch_one("SELECT * FROM customers WHERE telegram_id = ?", (message.from_user.id,))
     if not customer:
-        await message.answer("Данных пока нет. Они сохранятся после первого заказа.")
+        sent = await message.answer("Данных пока нет. Они сохранятся после первого заказа.")
+        await remember_active_screen(state, sent)
         return
-    await message.answer(
+    sent = await message.answer(
         "Ваши сохраненные данные:\n"
         f"ФИО: {customer.get('full_name') or '-'}\n"
         f"Телефон: {customer.get('phone') or '-'}\n"
         f"Адрес: {customer.get('address') or '-'}\n\n"
         "При новом заказе можно ввести другие данные, бот обновит карточку."
     )
+    await remember_active_screen(state, sent)

@@ -70,3 +70,17 @@ def order_summary_line(order: dict[str, Any]) -> str:
         f"#{order['id']} | {escape(order['created_at'][:16])} | "
         f"{escape(order.get('full_name') or 'Без имени')} | {escape(order['status'])}"
     )
+
+
+def user_order_summary_line(order: dict[str, Any]) -> str:
+    return f"#{order['id']} | {escape(order['created_at'][:16])} | {escape(order['status'])}"
+
+
+def customer_text(customer: dict[str, Any]) -> str:
+    return (
+        f"{customer_link(customer['telegram_id'], customer.get('username'))}\n"
+        f"ФИО: {escape(customer.get('full_name') or '-')}\n"
+        f"Телефон: {escape(customer.get('phone') or '-')}\n"
+        f"Адрес: {escape(customer.get('address') or '-')}\n"
+        f"Telegram ID: <code>{customer['telegram_id']}</code>"
+    )

@@ -74,6 +74,15 @@ def pay_order(order_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def user_orders_list(orders: list[dict]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for order in orders:
+        label = f"#{order['id']} | {order['created_at'][:16]} | {order['status']}"
+        builder.button(text=label, callback_data=f"user_order_detail:{order['id']}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def admin_products(products: list[dict]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for product in products:
@@ -130,6 +139,16 @@ def admin_customer_actions(telegram_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="История заказов клиента", callback_data=f"admin_customer_orders:{telegram_id}")]
         ]
     )
+
+
+def admin_customers_list(customers: list[dict]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for customer in customers:
+        full_name = customer.get("full_name") or "Без имени"
+        username = f"@{customer['username']}" if customer.get("username") else f"ID {customer['telegram_id']}"
+        builder.button(text=f"{full_name} | {username}", callback_data=f"admin_customer_detail:{customer['telegram_id']}")
+    builder.adjust(1)
+    return builder.as_markup()
 
 
 def stats_menu() -> InlineKeyboardMarkup:
